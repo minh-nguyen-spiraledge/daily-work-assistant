@@ -6,8 +6,9 @@ from typing import List, Dict, Tuple, Optional
 
 import requests
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -81,6 +82,7 @@ def ensure_user_state(user_id: int) -> None:
         USER_STATE[user_id] = {
             "last_fetched_tickets": [],
             "selected_tickets": [],
+            "morning_selected_keys": [],
             "last_chat_message_name": None,
             "last_chat_message_text": None,
             "last_chat_checked_at": None,
@@ -385,6 +387,47 @@ def format_ticket_report_line(ticket: Dict, percent: int = 0) -> str:
     return f"{ticket['key']} - {ticket['summary']} - {percent}%"
 
 
+def format_morning_selector_text(tickets: List[Dict], selected_keys: List[str]) -> str:
+    selected_count = len(selected_keys)
+    lines = [
+        "Select tickets for today:",
+        f"Selected: {selected_count}/{len(tickets)}",
+        "",
+        "Tap ticket buttons to toggle. Press Confirm when done.",
+    ]
+
+    if selected_keys:
+        lines.append("")
+        lines.append("Current selection:")
+        for key in selected_keys:
+            lines.append(f"- {key}")
+
+    return "\n".join(lines)
+
+
+def build_morning_keyboard(tickets: List[Dict], selected_keys: List[str]) -> InlineKeyboardMarkup:
+    selected_set = {key.upper() for key in selected_keys}
+    rows: List[List[InlineKeyboardButton]] = []
+
+    for ticket in rank_tickets(tickets):
+        key = ticket["key"]
+        checked = "✅" if key.upper() in selected_set else "☐"
+        score = get_ticket_score(ticket)
+        button_text = f"{checked} {key} ({score})"
+        rows.append(
+            [InlineKeyboardButton(button_text, callback_data=f"morning:toggle:{key}")]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton("Confirm", callback_data="morning:confirm"),
+            InlineKeyboardButton("Clear", callback_data="morning:clear"),
+        ]
+    )
+
+    return InlineKeyboardMarkup(rows)
+
+
 # --------------------------------------------------
 # TICKET LOOKUP
 # --------------------------------------------------
@@ -514,7 +557,7 @@ def build_daily_report(user_id: int, selected_tickets: List[Dict]) -> str:
         lines.append("- No tickets selected")
     else:
         for ticket in selected_tickets:
-            lines.append(f"- {format_ticket_report_line(ticket, percent=0)}")
+            lines.append(f"- {format_ticket_report_line(ticket, percent=100)}")
 
     return "\n".join(lines)
 
@@ -548,14 +591,113 @@ async def morning_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         logger.info("Fetched %s tickets for user %s", len(tickets), user_id)
 
-        message = format_suggested_tickets(tickets)
-        await update.message.reply_text(message)
+        if not tickets:
+            await update.message.reply_text("No assigned tickets found.")
+            return
+
+        previous_selected = USER_STATE[user_id]["selected_tickets"]
+        available_keys = {ticket["key"].upper() for ticket in tickets}
+        preselected = [
+            ticket["key"]
+            for ticket in previous_selected
+            if ticket["key"].upper() in available_keys
+        ]
+        USER_STATE[user_id]["morning_selected_keys"] = preselected
+
+        await update.message.reply_text(
+            format_morning_selector_text(tickets, preselected),
+            reply_markup=build_morning_keyboard(tickets, preselected),
+        )
 
     except Exception as e:
         logger.exception("Error fetching Jira tickets")
         await update.message.reply_text(
             f"Failed to fetch Jira tickets.\nError: {e}"
         )
+
+
+async def morning_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("morning:"):
+        return
+
+    user_id = query.from_user.id
+    ensure_user_state(user_id)
+
+    data = query.data
+    action = data.split(":", 2)[1] if ":" in data else ""
+    payload = data.split(":", 2)[2] if data.count(":") >= 2 else ""
+
+    tickets = USER_STATE[user_id]["last_fetched_tickets"]
+    if not tickets:
+        await query.answer("No ticket list found. Run /morning first.", show_alert=True)
+        return
+
+    selected_keys = list(USER_STATE[user_id].get("morning_selected_keys", []))
+    selected_set = {key.upper() for key in selected_keys}
+    ticket_keys = {ticket["key"].upper(): ticket["key"] for ticket in tickets}
+
+    if action == "toggle":
+        key = payload.upper()
+        if key not in ticket_keys:
+            await query.answer("Ticket not found in current queue.", show_alert=True)
+            return
+
+        normalized_key = ticket_keys[key]
+        if key in selected_set:
+            selected_keys = [item for item in selected_keys if item.upper() != key]
+            await query.answer(f"Unchecked {normalized_key}")
+        else:
+            selected_keys.append(normalized_key)
+            await query.answer(f"Checked {normalized_key}")
+
+        USER_STATE[user_id]["morning_selected_keys"] = selected_keys
+
+        try:
+            await query.edit_message_text(
+                format_morning_selector_text(tickets, selected_keys),
+                reply_markup=build_morning_keyboard(tickets, selected_keys),
+            )
+        except BadRequest as exc:
+            if "Message is not modified" not in str(exc):
+                raise
+        return
+
+    if action == "clear":
+        USER_STATE[user_id]["morning_selected_keys"] = []
+
+        await query.answer("Selection cleared")
+        try:
+            await query.edit_message_text(
+                format_morning_selector_text(tickets, []),
+                reply_markup=build_morning_keyboard(tickets, []),
+            )
+        except BadRequest as exc:
+            if "Message is not modified" not in str(exc):
+                raise
+        return
+
+    if action == "confirm":
+        if not selected_keys:
+            await query.answer("Select at least one ticket.", show_alert=True)
+            return
+
+        selected_set = {key.upper() for key in selected_keys}
+        selected_tickets = [
+            ticket for ticket in tickets if ticket["key"].upper() in selected_set
+        ]
+
+        USER_STATE[user_id]["selected_tickets"] = selected_tickets
+
+        lines = ["Selected tickets for today:", ""]
+        for ticket in selected_tickets:
+            lines.append(f"- {format_ticket_report_line(ticket)}")
+
+        await query.answer("Selection confirmed")
+        await query.edit_message_text("\n".join(lines))
+        return
+
+    await query.answer()
 
 
 async def select_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -629,7 +771,7 @@ async def preview_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     selected = USER_STATE[user_id]["selected_tickets"]
 
     if not selected:
-        await update.message.reply_text("No tickets selected.\nUse /select first.")
+        await update.message.reply_text("No tickets selected.\nUse /morning (checkbox) or /select first.")
         return
 
     try:
@@ -755,7 +897,7 @@ async def submit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     selected = USER_STATE[user_id]["selected_tickets"]
 
     if not selected:
-        await update.message.reply_text("No tickets selected.\nUse /select first.")
+        await update.message.reply_text("No tickets selected.\nUse /morning (checkbox) or /select first.")
         return
 
     try:
@@ -783,6 +925,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("morning", morning_command))
+    app.add_handler(CallbackQueryHandler(morning_callback, pattern=r"^morning:"))
     app.add_handler(CommandHandler("select", select_command))
     app.add_handler(CommandHandler("selected", selected_command))
     app.add_handler(CommandHandler("preview", preview_command))
